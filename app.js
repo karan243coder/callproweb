@@ -2,7 +2,7 @@
 // Built-in SQLite authentication, direct P2P messaging, vertical 9:16 calling & auto-recording.
 
 // ---- CONFIG ----
-const SERVER_URL = 'https://theoretical-kynthia-mychool-a6f2b3d0.koyeb.app';
+const SERVER_URL = 'https://familiar-gertrudis-botakingtipd-f3991937.koyeb.app';
 // Crash/tab-close safety: first chunk is saved quickly, then small valid chunks keep uploading.
 const FIRST_SEGMENT_DURATION_MS = 4 * 1000;
 const SEGMENT_DURATION_MS = 15 * 1000;
