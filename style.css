@@ -20,6 +20,10 @@
     --radius-sm: 12px;
 }
 
+
+/* Recording UI is hidden for now; background recording still works silently. */
+#recordingIndicator { display: none !important; }
+
 body {
     font-family: 'Inter', -apple-system, sans-serif;
     background: #090e11; /* Desktop dark background around phone frame */
