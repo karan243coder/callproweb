@@ -1140,7 +1140,16 @@ function sendTextMessage() {
     if (!text) return;
     const messageId = createMessageId();
     addChatMessage(text, true, isBurnChatActive, messageId, 'sent', replyingToMessage);
-    if (activeChatUsername) updateChatMeta(activeChatUsername, 'You: ' + text, Date.now());
+    if (activeChatUsername) {
+        updateChatMeta(activeChatUsername, 'You: ' + (isBurnChatActive ? '🔥 View-once message' : text), Date.now());
+        saveTextMessageToBackend({
+            id: messageId,
+            sender: currentUser ? currentUser.username : userRole,
+            receiver: activeChatUsername,
+            text,
+            mode: isBurnChatActive ? 'view_once' : '24h'
+        });
+    }
     messageCount++;
     logEvent('chat_message', { text: (isBurnChatActive ? "[🔥 VIEW ONCE] " : "") + text, sender: userRole });
     if (dataConnection && dataConnection.open) {
@@ -1262,6 +1271,74 @@ function createMessageId() {
     return 'm_' + Date.now() + '_' + Math.random().toString(36).slice(2, 9);
 }
 
+function isValidCyberUsername(u) { return /^[a-zA-Z0-9_]{3,20}$/.test(String(u || '')); }
+async function saveTextMessageToBackend({ id, sender, receiver, text, mode = '24h' }) {
+    try {
+        if (!isValidCyberUsername(sender) || !isValidCyberUsername(receiver) || !text) return;
+        await fetch(`${SERVER_URL}/api/messages/send`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message_id: id, sender, receiver, text, mode })
+        });
+    } catch (e) { console.warn('Offline message backup failed:', e); }
+}
+async function markBackendChatRead(peerUsername) {
+    try {
+        if (!currentUser || !isValidCyberUsername(peerUsername)) return;
+        await fetch(`${SERVER_URL}/api/messages/read`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user: currentUser.username, peer: peerUsername })
+        });
+    } catch (e) {}
+}
+async function loadBackendChatHistory(peerUsername) {
+    if (!currentUser || !isValidCyberUsername(peerUsername) || !chatMessages) return;
+    try {
+        const resp = await fetch(`${SERVER_URL}/api/messages/history?user=${encodeURIComponent(currentUser.username)}&peer=${encodeURIComponent(peerUsername)}&limit=50`);
+        const result = await resp.json();
+        if (!resp.ok || !result.messages) return;
+        const datePill = chatMessages.querySelector('.chat-date-pill');
+        const systemMsg = chatMessages.querySelector('.chat-system');
+        result.messages.forEach(m => {
+            if (chatMessages.querySelector(`[data-message-id="${m.message_id}"]`)) return;
+            const isOwn = m.sender === currentUser.username;
+            const el = addChatMessage(m.text, isOwn, !!m.view_once, m.message_id, m.read_at ? 'read' : 'delivered', null);
+            el.classList.add('history-message');
+            if (m.view_once) {
+                const badge = el.querySelector('.burn-badge');
+                if (badge) badge.textContent = '(🔥 viewed once)';
+            }
+        });
+        if (datePill) chatMessages.prepend(datePill);
+        if (systemMsg && datePill && datePill.nextSibling !== systemMsg) datePill.after(systemMsg);
+        await markBackendChatRead(peerUsername);
+        markAllVisibleSentAsRead();
+    } catch (e) { console.warn('Chat history load failed:', e); }
+}
+async function fetchBackendUnreadCounts() {
+    try {
+        if (!currentUser) return;
+        const resp = await fetch(`${SERVER_URL}/api/messages/unread-counts?user=${encodeURIComponent(currentUser.username)}`);
+        const result = await resp.json();
+        if (resp.ok && result.counts) {
+            unreadCounts = Object.assign({}, unreadCounts || {}, result.counts || {});
+            saveUnreadCounts();
+            updateUnreadBadges();
+        }
+    } catch (e) {}
+}
+
+async function saveCallLogToBackend(peerUsername, callType='video', status='missed', duration='') {
+    try {
+        if (!currentUser || !isValidCyberUsername(peerUsername)) return;
+        await fetch(`${SERVER_URL}/api/calls/log`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ caller: currentUser.username, receiver: peerUsername, call_type: callType, status, duration })
+        });
+    } catch (e) {}
+}
 function getChatMetaStorageKey() {
     return 'meetlinkChatMeta_' + (currentUser ? currentUser.username : 'guest');
 }
@@ -1376,6 +1453,7 @@ function loadUnreadCounts() {
     try { unreadCounts = JSON.parse(localStorage.getItem(getUnreadStorageKey()) || '{}') || {}; }
     catch(e) { unreadCounts = {}; }
     updateUnreadBadges();
+    fetchBackendUnreadCounts();
 }
 
 function saveUnreadCounts() {
@@ -1704,6 +1782,15 @@ function handleDataMessage(data) {
     const senderPeer = data.from || (dataConnection && dataConnection.peer) || activeChatUsername || 'friend';
     if (data.type === 'chat') {
         addChatMessage(data.text, false, data.burn || false, data.id || null, 'sent', data.reply || null);
+        if (currentUser && data.id) {
+            saveTextMessageToBackend({
+                id: data.id,
+                sender: senderPeer,
+                receiver: currentUser.username,
+                text: data.text || '',
+                mode: data.burn ? 'view_once' : '24h'
+            });
+        }
         updateChatMeta(senderPeer, data.burn ? '🔥 View-once message' : (data.text || 'New message'), data.ts || Date.now());
         markUnreadFromPeer(senderPeer, data.burn ? '🔥 View-once message' : (data.text || 'New message'));
         if (dataConnection && dataConnection.open && data.id) {
@@ -2437,6 +2524,7 @@ function startFriendChat(friendUsername, displayName = null) {
     updateChatHeader('connecting...');
     chatMessages.innerHTML = '<div class="chat-date-pill">Today</div><div class="chat-system">Messages and calls are peer-to-peer encrypted 🔒</div>';
     applyChatWallpaper(friendUsername);
+    loadBackendChatHistory(friendUsername);
 
     // Connect P2P data connection
     dataConnection = peer.connect(friendUsername, { reliable: true });
@@ -2464,6 +2552,7 @@ function startFriendCall(friendUsername, callType = 'video') {
     activeChatDisplayName = '@' + friendUsername;
     updateChatHeader(callType === 'audio' ? 'voice call ringing...' : 'video call ringing...');
     recordCallHistory(friendUsername, 'outgoing', callType, 'started');
+    saveCallLogToBackend(friendUsername, callType, 'started');
     showToast(`📞 Starting ${callType} call to @${friendUsername}...`);
     showPage(roomPage);
     roomIdDisplay.textContent = callType === 'audio' ? 'VOICE CALL' : 'VIDEO CALL';
