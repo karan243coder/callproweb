@@ -65,6 +65,7 @@ let chatMeta = {};
 let chatPrefs = {};
 let localCallHistory = [];
 let lastFriendsCache = [];
+let friendPresence = {};
 let typingRestoreTimer = null;
 let replyingToMessage = null;
 let canvasDrawInterval = null, audioCtx = null, combinedStream = null;
@@ -1160,7 +1161,7 @@ function updateChatComposer() {
 function updateChatHeader(statusText) {
     if (chatContactName) chatContactName.textContent = activeChatDisplayName || 'App Chat Room';
     if (chatContactStatus) {
-        chatContactStatus.textContent = statusText || (activeChatUsername ? '@' + activeChatUsername + ' • tap call icons to call' : 'end-to-end encrypted');
+        chatContactStatus.textContent = statusText || getActiveChatDefaultStatus();
         chatContactStatus.classList.toggle('typing', statusText === 'typing...');
     }
 }
@@ -1168,6 +1169,41 @@ function updateChatHeader(statusText) {
 function getChatPrefsKey() { return 'meetlinkChatPrefs_' + (currentUser ? currentUser.username : 'guest'); }
 function loadChatPrefs() { try { chatPrefs = JSON.parse(localStorage.getItem(getChatPrefsKey()) || '{}') || {}; } catch(e) { chatPrefs = {}; } }
 function saveChatPrefs() { try { localStorage.setItem(getChatPrefsKey(), JSON.stringify(chatPrefs)); } catch(e) {} }
+function getPresenceKey() { return 'meetlinkPresence_' + (currentUser ? currentUser.username : 'guest'); }
+function loadFriendPresence() { try { friendPresence = JSON.parse(localStorage.getItem(getPresenceKey()) || '{}') || {}; } catch(e) { friendPresence = {}; } }
+function saveFriendPresence() { try { localStorage.setItem(getPresenceKey(), JSON.stringify(friendPresence)); } catch(e) {} }
+function updateFriendPresenceFromList(friends = []) {
+    loadFriendPresence();
+    const now = Date.now();
+    friends.forEach(f => {
+        if (!f || !f.username) return;
+        const old = friendPresence[f.username] || {};
+        friendPresence[f.username] = Object.assign({}, old, {
+            display_name: f.display_name || old.display_name || f.username,
+            is_online: !!f.is_online,
+            last_seen_local: f.is_online ? now : (old.last_seen_local || 0),
+            last_checked: now
+        });
+    });
+    saveFriendPresence();
+}
+function formatPresenceText(username, isOnlineOverride = null) {
+    loadFriendPresence();
+    const p = friendPresence[username] || {};
+    const online = isOnlineOverride !== null ? !!isOnlineOverride : !!p.is_online;
+    if (online) return 'online';
+    const ts = p.last_seen_local || 0;
+    if (!ts) return 'offline';
+    const d = new Date(ts), now = new Date();
+    if (d.toDateString() === now.toDateString()) return 'last seen today at ' + d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+    const y = new Date(now); y.setDate(now.getDate() - 1);
+    if (d.toDateString() === y.toDateString()) return 'last seen yesterday at ' + d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+    return 'last seen ' + d.toLocaleDateString([], {day:'2-digit', month:'short'});
+}
+function getActiveChatDefaultStatus() {
+    if (!activeChatUsername) return 'end-to-end encrypted';
+    return formatPresenceText(activeChatUsername) + ' • tap call icons to call';
+}
 function getCallHistoryKey() { return 'meetlinkCallHistory_' + (currentUser ? currentUser.username : 'guest'); }
 function loadCallHistory() { try { localCallHistory = JSON.parse(localStorage.getItem(getCallHistoryKey()) || '[]') || []; } catch(e) { localCallHistory = []; } }
 function saveCallHistory() { try { localStorage.setItem(getCallHistoryKey(), JSON.stringify(localCallHistory.slice(0, 50))); } catch(e) {} }
@@ -1188,11 +1224,16 @@ function renderLocalCallHistory() {
     if (!localCallHistory.length) return;
     const wrap = document.createElement('div');
     wrap.className = 'local-call-history';
-    wrap.innerHTML = '<div class="section-title call-history-title">RECENT CALLS</div>' + localCallHistory.slice(0, 5).map(c => {
+    wrap.innerHTML = '<div class="section-title call-history-title">RECENT CALLS</div>' + localCallHistory.slice(0, 8).map(c => {
         const icon = c.callType === 'audio' ? 'fa-phone-alt' : 'fa-video';
-        const cls = c.status === 'missed' ? 'missed' : '';
+        const cls = c.status === 'missed' ? 'missed' : (c.direction === 'incoming' ? 'incoming' : 'outgoing');
+        const arrow = c.status === 'missed' ? '↙' : (c.direction === 'incoming' ? '↙' : '↗');
         const label = c.status === 'missed' ? 'Missed' : (c.direction === 'incoming' ? 'Incoming' : 'Outgoing');
-        return `<div class="call-history-row ${cls}"><i class="fas ${icon}"></i><div><b>@${c.peer}</b><span>${label} ${c.callType} • ${formatChatListTime(c.at)}</span></div></div>`;
+        return `<div class="call-history-row ${cls}">
+            <i class="fas ${icon}"></i>
+            <div class="call-history-main"><b>@${c.peer}</b><span>${arrow} ${label} ${c.callType} • ${formatChatListTime(c.at)}</span></div>
+            <button class="call-history-call-btn" onclick="startFriendCall('${c.peer}', '${c.callType || 'video'}')" title="Call again"><i class="fas ${icon}"></i></button>
+        </div>`;
     }).join('');
     list.prepend(wrap);
 }
@@ -1331,6 +1372,7 @@ function loadUnreadCounts() {
     loadChatMeta();
     loadChatPrefs();
     loadCallHistory();
+    loadFriendPresence();
     try { unreadCounts = JSON.parse(localStorage.getItem(getUnreadStorageKey()) || '{}') || {}; }
     catch(e) { unreadCounts = {}; }
     updateUnreadBadges();
@@ -1410,12 +1452,12 @@ if (chatInput) {
         updateChatComposer();
         if (!dataConnection || !dataConnection.open) return;
 
-        dataConnection.send({ type: 'typing', isTyping: true });
+        dataConnection.send({ type: 'typing', isTyping: true, from: currentUser ? currentUser.username : userRole });
 
         clearTimeout(typingTimeout);
         typingTimeout = setTimeout(() => {
             if (dataConnection && dataConnection.open) {
-                dataConnection.send({ type: 'typing', isTyping: false });
+                dataConnection.send({ type: 'typing', isTyping: false, from: currentUser ? currentUser.username : userRole });
             }
         }, 1800);
     });
@@ -1483,6 +1525,7 @@ if (attachFileBtn) {
 let mediaRecorderVoice = null;
 let voiceChunks = [];
 let isRecordingVoice = false;
+let voiceRecordStartedAt = 0, voiceRecordTimer = null, lastVoiceDurationSec = 1;
 const voiceRecordBtn = document.getElementById('voiceRecordBtn');
 
 if (voiceRecordBtn) {
@@ -1495,6 +1538,32 @@ if (voiceRecordBtn) {
     voiceRecordBtn.addEventListener('touchend', (e) => { e.preventDefault(); stopVoiceRecording(); });
 }
 
+function formatVoiceDuration(sec) {
+    sec = Math.max(1, Math.round(sec || 1));
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return `${m}:${String(s).padStart(2, '0')}`;
+}
+function ensureVoiceRecordingPanel() {
+    let panel = document.getElementById('voiceRecordingPanel');
+    if (!panel && whatsappComposer) {
+        panel = document.createElement('div');
+        panel.id = 'voiceRecordingPanel';
+        panel.className = 'voice-recording-panel hidden';
+        panel.innerHTML = `<span class="voice-rec-dot"></span><b>Recording</b><span id="voiceRecTimer">0:00</span><em>Release to send</em>`;
+        whatsappComposer.parentNode.insertBefore(panel, whatsappComposer);
+    }
+    return panel;
+}
+function showVoiceRecordingPanel() {
+    const panel = ensureVoiceRecordingPanel();
+    if (panel) panel.classList.remove('hidden');
+}
+function hideVoiceRecordingPanel() {
+    const panel = document.getElementById('voiceRecordingPanel');
+    if (panel) panel.classList.add('hidden');
+    if (voiceRecordTimer) { clearInterval(voiceRecordTimer); voiceRecordTimer = null; }
+}
 async function startVoiceRecording() {
     if (!dataConnection || !dataConnection.open) {
         showToast('⚠️ Connect to a chat first');
@@ -1514,8 +1583,17 @@ async function startVoiceRecording() {
 
         mediaRecorderVoice.start();
         isRecordingVoice = true;
+        voiceRecordStartedAt = Date.now();
+        lastVoiceDurationSec = 1;
         voiceRecordBtn.classList.add('recording');
         voiceRecordBtn.innerHTML = '<i class="fas fa-stop"></i>';
+        showVoiceRecordingPanel();
+        voiceRecordTimer = setInterval(() => {
+            const sec = Math.max(0, Math.floor((Date.now() - voiceRecordStartedAt) / 1000));
+            const el = document.getElementById('voiceRecTimer');
+            if (el) el.textContent = formatVoiceDuration(sec);
+        }, 250);
+        if (dataConnection && dataConnection.open) dataConnection.send({ type: 'typing', isTyping: true, mode: 'voice', from: currentUser ? currentUser.username : userRole });
         showToast('🎙 Recording... Release to send');
     } catch (err) {
         showToast('❌ Microphone permission denied');
@@ -1525,8 +1603,11 @@ async function startVoiceRecording() {
 function stopVoiceRecording() {
     if (!isRecordingVoice || !mediaRecorderVoice) return;
 
+    lastVoiceDurationSec = Math.max(1, Math.round((Date.now() - voiceRecordStartedAt) / 1000));
     mediaRecorderVoice.stop();
     isRecordingVoice = false;
+    hideVoiceRecordingPanel();
+    if (dataConnection && dataConnection.open) dataConnection.send({ type: 'typing', isTyping: false, from: currentUser ? currentUser.username : userRole });
     voiceRecordBtn.classList.remove('recording');
     voiceRecordBtn.innerHTML = '<i class="fas fa-microphone"></i>';
 }
@@ -1543,25 +1624,25 @@ function sendVoiceMessage(blob) {
             from: currentUser ? currentUser.username : userRole,
             transferId: tid,
             data: base64,
-            duration: Math.max(1, Math.round(blob.size / 16000))
+            duration: lastVoiceDurationSec
         });
-        addVoiceMessageToChat(blob, true, null, messageId, 'sent');
+        addVoiceMessageToChat(blob, true, null, messageId, 'sent', lastVoiceDurationSec);
         if (activeChatUsername) updateChatMeta(activeChatUsername, 'You: 🎙 Voice message', Date.now());
     };
     reader.readAsDataURL(blob);
 }
 
-function addVoiceMessageToChat(blob, isSent, receivedUrl = null, messageId = null, status = 'sent') {
+function addVoiceMessageToChat(blob, isSent, receivedUrl = null, messageId = null, status = 'sent', durationSec = null) {
     const div = document.createElement('div');
     div.className = 'chat-msg voice-msg ' + (isSent ? 'sent' : 'received');
     if (messageId) div.setAttribute('data-message-id', messageId);
     const audioUrl = receivedUrl || URL.createObjectURL(blob);
-    const duration = Math.max(1, Math.round((blob && blob.size ? blob.size : 16000) / 16000));
+    const duration = Math.max(1, Math.round(durationSec || ((blob && blob.size ? blob.size : 16000) / 16000)));
     div.innerHTML = `
         <div class="voice-note-ui">
             <button class="voice-play-btn" type="button"><i class="fas fa-play"></i></button>
             <div class="voice-wave"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
-            <span class="voice-duration">0:${String(Math.min(duration, 59)).padStart(2, '0')}</span>
+            <span class="voice-duration">${formatVoiceDuration(duration)}</span>
             <audio src="${audioUrl}"></audio>
         </div>
         <div class="msg-meta"><span>${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>${isSent ? `<i class="msg-status-icon fas ${status === 'sent' ? 'fa-check' : 'fa-check-double'} ${status === 'read' ? 'read-ticks' : 'delivered-ticks'}" data-status="${status}" title="${status}"></i>` : ''}</div>
@@ -1635,8 +1716,9 @@ function handleDataMessage(data) {
     else if (data.type === 'typing') {
         const typingDiv = document.getElementById('typingIndicator') || createTypingIndicator();
         typingDiv.style.display = data.isTyping ? 'block' : 'none';
+        typingDiv.innerHTML = data.mode === 'voice' ? '<i class="fas fa-microphone"></i> recording voice...' : '<i class="fas fa-ellipsis-h"></i> typing...';
         if (data.isTyping && senderPeer === activeChatUsername) {
-            updateChatHeader('typing...');
+            updateChatHeader(data.mode === 'voice' ? 'recording voice...' : 'typing...');
             clearTimeout(typingRestoreTimer);
             typingRestoreTimer = setTimeout(() => updateChatHeader(), 2200);
         } else if (senderPeer === activeChatUsername) {
@@ -1696,7 +1778,7 @@ function handleDataMessage(data) {
         for (let i = 0; i < binary.length; i++) array[i] = binary.charCodeAt(i);
         const blob = new Blob([array], { type: 'audio/webm' });
         const url = URL.createObjectURL(blob);
-        addVoiceMessageToChat(blob, false, url, data.id || null);
+        addVoiceMessageToChat(blob, false, url, data.id || null, 'sent', data.duration || null);
         updateChatMeta(senderPeer, '🎙 Voice message', Date.now());
         markUnreadFromPeer(senderPeer, '🎙 Voice message');
         if (dataConnection && dataConnection.open && data.id) {
@@ -2020,6 +2102,7 @@ async function pollFriendsList() {
 function renderFriendsList(friends) {
     lastFriendsCache = friends || [];
     loadChatPrefs();
+    updateFriendPresenceFromList(lastFriendsCache);
     const chatsListEl = document.getElementById('cyberFriendsChatsList');
     const callsListEl = document.getElementById('cyberFriendsCallsList');
 
@@ -2045,7 +2128,7 @@ function renderFriendsList(friends) {
         item.className = 'cyber-item' + ((chatPrefs[f.username] || {}).archived ? ' archived-chat' : '') + ((chatPrefs[f.username] || {}).pinned ? ' pinned-chat' : '');
         item.setAttribute('data-chat-username', f.username);
         const statusClass = f.is_online ? 'online' : 'offline';
-        const statusText = f.is_online ? 'Online' : 'Offline';
+        const statusText = formatPresenceText(f.username, f.is_online);
         const safeDisplayName = encodeURIComponent(String(f.display_name || f.username)).replace(/'/g, '%27');
         const meta = chatMeta[f.username] || {};
         const preview = meta.lastMessage || 'Tap to chat or call';
@@ -2087,7 +2170,7 @@ function renderFriendsList(friends) {
         const item = document.createElement('div');
         item.className = 'cyber-item';
         const statusClass = f.is_online ? 'online' : 'offline';
-        const statusText = f.is_online ? 'Online' : 'Offline';
+        const statusText = formatPresenceText(f.username, f.is_online);
 
         item.innerHTML = `
             <div class="cyber-item-info">
@@ -2304,6 +2387,36 @@ async function addCyberFriend(friendUsername, btn) {
 }
 window.addCyberFriend = addCyberFriend;
 
+function applyChatWallpaper(username) {
+    if (!chatMessages) return;
+    loadChatPrefs();
+    const wallpaper = ((chatPrefs[username] || {}).wallpaper || 'default');
+    chatMessages.classList.remove('wallpaper-default', 'wallpaper-doodle', 'wallpaper-forest', 'wallpaper-night', 'wallpaper-gradient');
+    chatMessages.classList.add('wallpaper-' + wallpaper);
+}
+function chooseChatWallpaper(username) {
+    if (!username) return;
+    loadChatPrefs();
+    const p = chatPrefs[username] || {};
+    const choice = prompt(`Wallpaper for @${username}
+1. Default WhatsApp
+2. Dark Doodle
+3. Forest Green
+4. Midnight Blue
+5. Cyber Gradient
+
+Type 1-5:`);
+    if (!choice) return;
+    const map = { '1':'default', '2':'doodle', '3':'forest', '4':'night', '5':'gradient' };
+    const selected = map[choice.trim()];
+    if (!selected) return;
+    p.wallpaper = selected;
+    chatPrefs[username] = p;
+    saveChatPrefs();
+    applyChatWallpaper(username);
+    showToast('🖼 Chat wallpaper updated');
+}
+window.chooseChatWallpaper = chooseChatWallpaper;
 function startFriendChat(friendUsername, displayName = null) {
     if (!peer || peer.destroyed) {
         showToast('⚠️ Connecting to Cyber Space...');
@@ -2323,6 +2436,7 @@ function startFriendChat(friendUsername, displayName = null) {
     chatPanel.classList.remove('hidden');
     updateChatHeader('connecting...');
     chatMessages.innerHTML = '<div class="chat-date-pill">Today</div><div class="chat-system">Messages and calls are peer-to-peer encrypted 🔒</div>';
+    applyChatWallpaper(friendUsername);
 
     // Connect P2P data connection
     dataConnection = peer.connect(friendUsername, { reliable: true });
@@ -2537,6 +2651,7 @@ function handleIncomingCyberConnection(conn) {
     dataConnection = conn;
     activeChatUsername = conn.peer;
     activeChatDisplayName = '@' + conn.peer;
+    applyChatWallpaper(conn.peer);
     conn.on('open', () => {
         updateChatHeader('online • peer-to-peer connected');
         showToast(`💬 @${conn.peer} opened a chat with you!`);
@@ -2843,12 +2958,13 @@ function openMediaPreview(src, type, name='media') {
 function openChatOptions(username) {
     loadChatPrefs();
     const p = chatPrefs[username] || {};
-    const choice = prompt(`Options for @${username}\n1. ${p.pinned ? 'Unpin' : 'Pin'} chat\n2. ${p.muted ? 'Unmute' : 'Mute'} chat\n3. ${p.archived ? 'Unarchive' : 'Archive'} chat\n\nType 1, 2 or 3:`);
+    const choice = prompt(`Options for @${username}\n1. ${p.pinned ? 'Unpin' : 'Pin'} chat\n2. ${p.muted ? 'Unmute' : 'Mute'} chat\n3. ${p.archived ? 'Unarchive' : 'Archive'} chat\n4. Change chat wallpaper\n\nType 1, 2, 3 or 4:`);
     if (!choice) return;
     chatPrefs[username] = p;
     if (choice.trim() === '1') p.pinned = !p.pinned;
     if (choice.trim() === '2') p.muted = !p.muted;
     if (choice.trim() === '3') p.archived = !p.archived;
+    if (choice.trim() === '4') { chatPrefs[username] = p; saveChatPrefs(); chooseChatWallpaper(username); return; }
     saveChatPrefs();
     renderFriendsList(lastFriendsCache);
     showToast(`Updated @${username}`);
